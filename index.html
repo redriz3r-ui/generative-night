@@ -1,0 +1,712 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Generative Night: Action + Stain (p5.js)</title>
+  <style>
+    html, body { margin:0; padding:0; height:100%; background:#0b0b0b; overflow:hidden; }
+    canvas { display:block; }
+    .hud{
+      position:fixed; left:12px; top:12px;
+      font: 12px/1.35 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      color: rgba(255,255,255,0.88);
+      background: rgba(0,0,0,0.36);
+      padding: 10px 12px;
+      border-radius: 12px;
+      user-select:none;
+      backdrop-filter: blur(6px);
+      max-width: min(520px, calc(100vw - 24px));
+    }
+    .hud kbd{
+      font: inherit;
+      padding: 1px 6px;
+      border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.2);
+      background: rgba(255,255,255,0.08);
+    }
+    .hint { opacity: 0.9; }
+    .sub  { opacity: 0.78; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div class="hud" id="hud">
+    <div class="hint">
+      <b>Mode:</b> <span id="modeLabel">STAIN</span>
+      &nbsp;|&nbsp;
+      <kbd>1</kbd> Stain &nbsp; <kbd>2</kbd> Action
+      &nbsp;|&nbsp;
+      <kbd>C</kbd> Clear &nbsp; <kbd>S</kbd> Save &nbsp; <kbd>W</kbd> Rain On/Off &nbsp; <kbd>M</kbd> Sim Rain &nbsp; <kbd>[</kbd>/<kbd>]</kbd> Intensity
+    </div>
+    <div class="sub">
+      <b>Stain:</b> click/pause to pour, drag to guide (slow).<br/>
+      <b>Action:</b> click/drag to throw, hold <kbd>SHIFT</kbd> = thin splatter.<br/>
+      <b>Weather:</b> <span id="weatherStatus">loading…</span>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.9.3/lib/p5.min.js"></script>
+  <script>
+    // ============================================================
+    // Generative Painting: ACTION (Pollock-ish) + STAIN (Frankenthaler-ish)
+    // Single-file p5.js sketch.
+    // ============================================================
+
+    // Modes
+    const MODE_STAIN  = "STAIN";
+    const MODE_ACTION = "ACTION";
+    let MODE = MODE_STAIN;
+
+    // Palettes
+    let palette = [];
+    let activePalette = [];
+
+    // Canvas base
+    let bg;
+    let lastMouse;
+
+    // Action-mode drips
+    let drips = [];
+
+    // Stain-mode flowfield (gentle tilt + noise)
+    let flowSeed = 0;
+    let tilt; // vector
+
+    // UI
+    let modeLabelEl;
+    let weatherStatusEl;
+
+    // Weather-synced "raindrop clicks"
+    // Uses Open-Meteo (no API key). Falls back to Fresno if geolocation is denied.
+    let GEO = { lat: 36.7378, lon: -119.7871 }; // Fresno default
+    let rain = {
+      enabled: true,
+      simulate: false,
+      simDropsPerSec: 8,   // default simulated intensity (drops/sec)
+      dropsPerSec: 0,
+      lastWeatherMs: 0,
+      nextDropMs: 0,
+      status: "loading…"
+    };
+
+    function setup() {
+      createCanvas(windowWidth, windowHeight);
+      pixelDensity(2);
+
+      modeLabelEl = document.getElementById("modeLabel");
+      weatherStatusEl = document.getElementById("weatherStatus");
+
+      // Slightly warm canvas ground (paper/canvas)
+      bg = color(245, 241, 232);
+      background(bg);
+
+      // Master palette (tweak freely)
+      palette = [
+        color(12, 12, 14, 220),     // near-black
+        color(240, 240, 240, 190),  // chalk white
+        color(220, 40, 50, 170),    // red
+        color(30, 95, 200, 160),    // blue
+        color(245, 195, 40, 160),   // ochre/yellow
+        color(35, 160, 110, 150),   // green
+        color(120, 60, 160, 140),   // violet
+        color(190, 90, 35, 150)     // sienna/orange
+      ];
+
+      // Add subtle paper grain once
+      drawGrain(0.05);
+
+      // Choose a session palette (important for cohesion)
+      reseedSessionPalette();
+
+      // Stain flowfield orientation
+      flowSeed = random(10000);
+      tilt = p5.Vector.fromAngle(random(-PI/3, PI/3)).mult(0.45); // gentle directional bias
+
+      lastMouse = createVector(mouseX, mouseY);
+
+      updateModeLabel();
+
+      // Start weather-driven raindrops
+      initWeatherSync();
+      // Refresh weather periodically (every 5 minutes)
+      setInterval(updateWeather, 5 * 60 * 1000);
+    }
+
+    function draw() {
+      if (rain.enabled) spawnRainDrops();
+      if (weatherStatusEl) {
+        const label = rain.simulate ? "SIM" : "LIVE";
+        const dpsText = (rain.simulate ? rain.simDropsPerSec : rain.dropsPerSec).toFixed(1);
+        const base = (typeof rain.status === "string" && rain.status.length) ? rain.status : "loading…";
+        weatherStatusEl.textContent = rain.enabled
+          ? `${label} | ${base} | ${dpsText} drops/s`
+          : "off";
+      }
+      // ACTION drips animate slowly over time
+      if (MODE === MODE_ACTION) {
+        for (let i = drips.length - 1; i >= 0; i--) {
+          drips[i].update();
+          drips[i].render();
+          if (drips[i].dead) drips.splice(i, 1);
+        }
+
+        // Very subtle unifying wash occasionally
+        if (frameCount % 240 === 0) unifyWash(6);
+      }
+
+      // STAIN mode: you can optionally apply a super light “drying” haze
+      if (MODE === MODE_STAIN) {
+        if (frameCount % 420 === 0) unifyWash(4);
+      }
+    }
+
+    // ============================================================
+    // Interaction
+    // ============================================================
+
+    function mousePressed() {
+      lastMouse = createVector(mouseX, mouseY);
+
+      if (MODE === MODE_STAIN) {
+        pourStain(mouseX, mouseY, 1.0);
+      } else {
+        throwPaintFromGesture(true);
+      }
+      return false;
+    }
+
+    function mouseDragged() {
+      if (MODE === MODE_STAIN) {
+        // restraint: not every frame
+        if (frameCount % 6 === 0) {
+          // drag "guides" the pour directionally
+          pourStain(mouseX, mouseY, 0.75);
+        }
+      } else {
+        throwPaintFromGesture(false);
+      }
+      return false;
+    }
+
+    function touchStarted(){ mousePressed(); return false; }
+    function touchMoved(){ mouseDragged(); return false; }
+
+    function keyPressed(){
+      if (key === '1') { setMode(MODE_STAIN); }
+      if (key === '2') { setMode(MODE_ACTION); }
+      if (key === 'w' || key === 'W') {
+        rain.enabled = !rain.enabled;
+        rain.status = rain.enabled ? (rain.status || "loading…") : "off";
+      }
+      if (key === 'm' || key === 'M') {
+        rain.simulate = !rain.simulate;
+        // If sim is enabled, don't depend on weather being available
+        rain.lastWeatherMs = rain.lastWeatherMs || Date.now();
+      }
+      // Adjust simulated intensity (drops/sec)
+      if (key === '[') {
+        rain.simDropsPerSec = max(0, rain.simDropsPerSec - 1);
+      }
+      if (key === ']') {
+        rain.simDropsPerSec = min(60, rain.simDropsPerSec + 1);
+      }
+
+      if (key === 'c' || key === 'C') {
+        background(bg);
+        drawGrain(0.05);
+        drips.length = 0;
+        // For a new "painting", also re-pick a session palette
+        reseedSessionPalette();
+        flowSeed = random(10000);
+        tilt = p5.Vector.fromAngle(random(-PI/3, PI/3)).mult(0.45);
+        rain.nextDropMs = 0;
+        // Re-sync weather after clearing so the raindrops match current conditions
+        updateWeather();
+      }
+
+      if (key === 's' || key === 'S') {
+        saveCanvas(`painting-${MODE.toLowerCase()}`, 'png');
+      }
+    }
+
+    function setMode(nextMode){
+      MODE = nextMode;
+      // Recompute raindrop rate for the new mode
+      updateWeather();
+      updateModeLabel();
+      // In stain mode, keep drips from cluttering the concept
+      if (MODE === MODE_STAIN) drips.length = 0;
+    }
+
+    function updateModeLabel(){
+      if (modeLabelEl) modeLabelEl.textContent = MODE;
+    }
+
+    function windowResized(){
+      // Preserve artwork on resize
+      const g = get();
+      resizeCanvas(windowWidth, windowHeight);
+      background(bg);
+      image(g, 0, 0);
+    }
+
+    // ============================================================
+    // Session palette logic (cohesion rule)
+    // ============================================================
+
+    function reseedSessionPalette(){
+      shuffle(palette, true);
+
+      // Frankenthaler: restrained (2–4)
+      // Action: can be a bit wider (3–6)
+      const n = (MODE === MODE_STAIN)
+        ? int(random(2, 5))
+        : int(random(3, 7));
+
+      activePalette = palette.slice(0, n);
+
+      // Make sure we have at least one dark OR one light anchor sometimes
+      if (random() < 0.5) {
+        activePalette.push(color(12, 12, 14, 220));
+      } else {
+        activePalette.push(color(240, 240, 240, 190));
+      }
+    }
+
+    // ============================================================
+    // STAIN MODE (Frankenthaler-inspired): pour + soak + bleed
+    // ============================================================
+
+    function pourStain(x, y, strength=1.0) {
+      const col = random(activePalette);
+
+      // Larger radii, low alpha, layered passes to simulate absorption
+      const baseR = random(width * 0.07, width * 0.17) * strength;
+
+      // Keep space active: probabilistically do nothing (forces restraint)
+      if (random() < 0.06) return;
+
+      // Main soak layers
+      const layers = int(random(9, 18));
+      noStroke();
+
+      for (let i = 0; i < layers; i++) {
+        const t = i / max(1, (layers - 1));
+
+        // Feathered radius + wandering center
+        const r = baseR * random(0.70, 1.30) * (1.0 - t * 0.18);
+        const a = random(7, 20) * (1.0 - t * 0.15);
+
+        // Gentle flow bias (tilt + local noise field)
+        const v = stainFlowVector(x, y).mult(r * 0.03);
+        const ox = randomGaussian(0, r * 0.10) + v.x;
+        const oy = randomGaussian(0, r * 0.10) + v.y;
+
+        fill(red(col), green(col), blue(col), a);
+        ellipse(x + ox, y + oy, r, r * random(0.90, 1.05));
+      }
+
+      // Soft edge halo (bleed)
+      stainHalo(x, y, baseR, col);
+
+      // Occasional gravity bleed trails (subtle)
+      if (random() < 0.55) {
+        stainBleed(x, y, col, baseR);
+      }
+
+      // Rare pooling "edge" (a darker ring), but still soft
+      if (random() < 0.18) {
+        softPoolEdge(x, y, baseR, col);
+      }
+    }
+
+    function stainFlowVector(x, y){
+      // A very soft flow field: tilt + perlin noise curl-ish
+      const nx = x * 0.0015;
+      const ny = y * 0.0015;
+
+      const n1 = noise(nx + flowSeed, ny + flowSeed);
+      const n2 = noise(nx + 50 + flowSeed, ny + 50 + flowSeed);
+
+      // Map noise to a small vector direction
+      const ang = (n1 * TWO_PI * 1.2) + (n2 * 0.8);
+      const v = p5.Vector.fromAngle(ang).mult(0.35);
+
+      // Add a constant tilt
+      return v.add(tilt);
+    }
+
+    function stainHalo(x, y, r, col){
+      // Feathery bleeding edge: repeated translucent rings
+      noStroke();
+      const rings = int(random(6, 10));
+      for (let i = 0; i < rings; i++) {
+        const rr = r * random(1.05, 1.45);
+        const a = random(3, 9);
+        fill(red(col), green(col), blue(col), a);
+        ellipse(x + randomGaussian(0, rr * 0.03), y + randomGaussian(0, rr * 0.03), rr, rr);
+      }
+    }
+
+    function stainBleed(x, y, col, r){
+      // A gentle vertical-ish bleed that follows flowfield slightly
+      const len = random(80, 260);
+      const steps = int(len / 5);
+      let px = x;
+      let py = y;
+
+      for (let i = 0; i < steps; i++) {
+        const t = i / max(1, steps - 1);
+
+        const fv = stainFlowVector(px, py);
+        // Favor downward motion, but let flowfield steer
+        const dx = fv.x * 1.4 + randomGaussian(0, 0.35);
+        const dy = abs(fv.y) * 1.6 + 1.8 + randomGaussian(0, 0.35);
+
+        px += dx;
+        py += dy;
+
+        const spread = lerp(r * 0.08, r * 0.22, t);
+        const a = lerp(16, 3.5, t);
+
+        noStroke();
+        fill(red(col), green(col), blue(col), a);
+        ellipse(px + randomGaussian(0, spread), py, random(8, 18), random(6, 16));
+
+        // occasional little side bleed
+        if (random() < 0.10) {
+          fill(red(col), green(col), blue(col), a * 0.6);
+          ellipse(px + randomGaussian(0, spread * 1.2), py + random(3, 10), random(5, 12));
+        }
+
+        if (py > height + 20) break;
+      }
+    }
+
+    function softPoolEdge(x, y, r, col){
+      // Slightly darker pooling near an edge, but kept soft
+      push();
+      noFill();
+      const a = 22;
+      stroke(red(col), green(col), blue(col), a);
+      strokeWeight(random(0.6, 1.4));
+      const steps = 70;
+
+      beginShape();
+      for (let i = 0; i < steps; i++) {
+        const ang = map(i, 0, steps, 0, TWO_PI);
+        const n = noise(x * 0.002 + cos(ang) * 2, y * 0.002 + sin(ang) * 2, flowSeed);
+        const rr = r * (0.90 + n * 0.35) + random(-r * 0.05, r * 0.05);
+        vertex(x + cos(ang) * rr, y + sin(ang) * rr);
+      }
+      endShape(CLOSE);
+      pop();
+    }
+
+    // ============================================================
+    // ACTION MODE (Pollock-ish): throw paint with droplets, streaks, drips
+    // ============================================================
+
+    function throwPaintFromGesture(isTap) {
+      const cur = createVector(mouseX, mouseY);
+      const vel = p5.Vector.sub(cur, lastMouse);
+      lastMouse = cur.copy();
+
+      const speed = constrain(vel.mag(), 0, 60);
+      const thin = keyIsDown(SHIFT);
+
+      // Action radius: faster = bigger
+      const baseR = isTap
+        ? random(18, 55)
+        : map(speed, 0, 60, thin ? 8 : 14, thin ? 22 : 70);
+
+      const col = random(activePalette);
+
+      const dir = (vel.mag() < 0.5) ? p5.Vector.random2D() : vel.copy().normalize();
+      const intensity = isTap ? 0.65 : map(speed, 0, 60, 0.2, 1.0);
+
+      makeSplat(cur.x, cur.y, baseR, col, dir, intensity, thin);
+    }
+
+    function makeSplat(x, y, r, col, dir, intensity, thin) {
+      push();
+      noStroke();
+
+      // Main blob layers
+      for (let k = 0; k < (thin ? 6 : 10); k++) {
+        const rr = r * random(0.55, 1.05);
+        const ox = randomGaussian(0, r * 0.08);
+        const oy = randomGaussian(0, r * 0.08);
+
+        const a = alpha(col) * random(0.55, 0.95);
+        fill(red(col), green(col), blue(col), a);
+
+        ellipse(x + ox, y + oy, rr, rr * random(0.85, 1.1));
+      }
+
+      // Ragged edge
+      drawRaggedEdge(x, y, r, col);
+
+      // Droplets
+      const drops = floor(map(intensity, 0.2, 1.0, thin ? 35 : 55, thin ? 90 : 150));
+      for (let i = 0; i < drops; i++) {
+        const t = pow(random(), thin ? 1.3 : 0.8);
+        const dist = r * (thin ? random(0.8, 6.5) : random(0.7, 8.0)) * t;
+
+        const bias = p5.Vector.mult(dir, dist * random(0.55, 1.2));
+        const jitter = p5.Vector.random2D().mult(dist * random(0.15, thin ? 0.55 : 0.75));
+        const p = p5.Vector.add(createVector(x, y), bias).add(jitter);
+
+        const d = (thin ? random(1.0, 4.0) : random(1.2, 7.5)) * (1 - t * 0.6);
+        const a = alpha(col) * random(0.35, 0.9) * (thin ? 0.8 : 1.0);
+
+        fill(red(col), green(col), blue(col), a);
+        ellipse(p.x, p.y, d, d);
+
+        if (!thin && random() < 0.07) {
+          fill(red(col), green(col), blue(col), a * 0.6);
+          ellipse(p.x + random(-6, 6), p.y + random(-6, 6), d * 0.55);
+        }
+
+        // Rare drip seeds
+        if (!thin && d > 4.8 && random() < 0.03) {
+          drips.push(new Drip(p.x, p.y, col, d));
+        }
+      }
+
+      // Motion streaks
+      if (!thin && random() < 0.55 && intensity > 0.35) {
+        const streaks = floor(random(2, 5));
+        for (let s = 0; s < streaks; s++) {
+          const len = random(r * 0.8, r * 3.2) * intensity;
+          const w = random(1.2, 4.2);
+          const angleJ = random(-0.45, 0.45);
+          drawStreak(x, y, dir.heading() + angleJ, len, w, col);
+        }
+      }
+
+      pop();
+    }
+
+    function drawRaggedEdge(x, y, r, col) {
+      push();
+      noFill();
+      const steps = 90;
+      const baseA = alpha(col) * 0.35;
+      stroke(red(col), green(col), blue(col), baseA);
+      strokeWeight(random(0.6, 1.5));
+
+      beginShape();
+      for (let i = 0; i < steps; i++) {
+        const ang = map(i, 0, steps, 0, TWO_PI);
+        const n = noise(x * 0.003 + cos(ang) * 2, y * 0.003 + sin(ang) * 2, frameCount * 0.001);
+        const rr = r * (0.9 + n * 0.55) + random(-r * 0.08, r * 0.08);
+        vertex(x + cos(ang) * rr, y + sin(ang) * rr);
+      }
+      endShape(CLOSE);
+      pop();
+    }
+
+    function drawStreak(x, y, ang, len, w, col) {
+      push();
+      stroke(red(col), green(col), blue(col), alpha(col) * random(0.25, 0.55));
+      strokeWeight(w);
+      strokeCap(ROUND);
+
+      const dx = cos(ang), dy = sin(ang);
+      const x2 = x + dx * len;
+      const y2 = y + dy * len;
+
+      const segs = 10;
+      let px = x, py = y;
+      for (let i = 1; i <= segs; i++) {
+        const t = i / segs;
+        const nx = lerp(x, x2, t) + randomGaussian(0, w * 0.8);
+        const ny = lerp(y, y2, t) + randomGaussian(0, w * 0.8);
+        line(px, py, nx, ny);
+        px = nx; py = ny;
+      }
+      pop();
+    }
+
+    class Drip {
+      constructor(x, y, col, size) {
+        this.x = x;
+        this.y = y;
+        this.col = col;
+        this.w = size * random(0.12, 0.22);
+        this.v = random(0.25, 1.1);
+        this.maxLen = random(40, 240);
+        this.len = 0;
+        this.dead = false;
+      }
+      update() {
+        if (this.dead) return;
+        const step = this.v * (1 + this.w * 0.12);
+        this.y += step;
+        this.len += step;
+        if (this.len > this.maxLen || this.y > height + 20) this.dead = true;
+      }
+      render() {
+        if (this.dead) return;
+        push();
+        stroke(red(this.col), green(this.col), blue(this.col), alpha(this.col) * 0.25);
+        strokeWeight(this.w);
+        strokeCap(ROUND);
+        line(this.x, this.y - 6, this.x + randomGaussian(0, this.w * 0.35), this.y + 8);
+
+        noStroke();
+        fill(red(this.col), green(this.col), blue(this.col), alpha(this.col) * 0.35);
+        ellipse(this.x, this.y + 8, this.w * 1.4, this.w * 1.2);
+        pop();
+      }
+    }
+
+    // ============================================================
+    // Canvas texture + unifying wash
+    // ============================================================
+
+    function drawGrain(strength=0.06){
+      loadPixels();
+      for (let y = 0; y < height; y += 2) {
+        for (let x = 0; x < width; x += 2) {
+          const i = 4 * (y * width + x);
+          const n = (random() - 0.5) * 255 * strength;
+          pixels[i]     = constrain(pixels[i]     + n, 0, 255);
+          pixels[i + 1] = constrain(pixels[i + 1] + n, 0, 255);
+          pixels[i + 2] = constrain(pixels[i + 2] + n, 0, 255);
+        }
+      }
+      updatePixels();
+    }
+
+    function unifyWash(alphaAmt=6){
+      push();
+      noStroke();
+      fill(245, 241, 232, alphaAmt);
+      rect(0, 0, width, height);
+      pop();
+    }
+
+    // ============================================================
+    // Weather-synced raindrops (automated "clicks")
+    // ============================================================
+
+    async function initWeatherSync() {
+      // Attempt to use the user's location; fall back to Fresno.
+      if ("geolocation" in navigator) {
+        navigator.geolocation.getCurrentPosition(
+          (pos) => {
+            GEO.lat = pos.coords.latitude;
+            GEO.lon = pos.coords.longitude;
+            updateWeather();
+          },
+          () => {
+            updateWeather();
+          },
+          { enableHighAccuracy: false, timeout: 5000 }
+        );
+      } else {
+        updateWeather();
+      }
+    }
+
+    async function updateWeather() {
+      const lat = GEO.lat, lon = GEO.lon;
+
+      // Open-Meteo: current precipitation + hourly precipitation probability.
+      const url =
+        `https://api.open-meteo.com/v1/forecast` +
+        `?latitude=${lat}&longitude=${lon}` +
+        `&current=precipitation,rain,showers` +
+        `&hourly=precipitation_probability` +
+        `&timezone=auto`;
+
+      try {
+        const res = await fetch(url);
+        const data = await res.json();
+
+        const cur = data.current || {};
+        const precipMm = Number(cur.precipitation ?? 0); // mm/hr
+        const rainMm   = Number(cur.rain ?? 0);          // mm/hr
+
+        // Find precipitation probability for the current timestamp (best-effort)
+        let prob = 0;
+        if (data.hourly && data.hourly.time && data.hourly.precipitation_probability) {
+          const nowIso = data.current?.time;
+          const idx = nowIso ? data.hourly.time.indexOf(nowIso) : -1;
+          prob = idx >= 0 ? Number(data.hourly.precipitation_probability[idx] ?? 0) : 0;
+        }
+
+        // Convert to raindrop rate (heuristic mapping)
+        const p = constrain(prob / 100, 0, 1);
+        const intensity = constrain(precipMm / 3.0, 0, 1); // ~3mm/hr feels "heavy" visually
+        const combined = max(p * 0.7, intensity);
+
+        // Map to drops/sec:
+        // - STAIN: calmer
+        // - ACTION: more energetic
+        rain.dropsPerSec = (MODE === MODE_STAIN)
+          ? lerp(0, 18, combined)
+          : lerp(0, 28, combined);
+
+        const label = rain.simulate ? "SIM" : "LIVE";
+        const dpsText = (rain.simulate ? rain.simDropsPerSec : rain.dropsPerSec).toFixed(1);
+        rain.status = rain.enabled
+          ? `${label} | precip ${precipMm.toFixed(2)} mm/hr | pop ${prob}% | target ${dpsText}`
+          : "off";
+
+        rain.lastWeatherMs = Date.now();
+      } catch (e) {
+        rain.dropsPerSec = 0;
+        rain.status = rain.enabled ? "weather fetch failed (offline?)" : "off";
+      }
+    }
+
+    function spawnRainDrops() {
+      // If weather hasn't loaded yet, don't spam; also triggers a fetch occasionally.
+      if (!rain.lastWeatherMs) {
+        if (frameCount % 120 === 0) updateWeather();
+        return;
+      }
+
+      // Use simulated rate if enabled; otherwise use live weather-derived rate.
+      // If live rate is ~0 but rain is enabled, add a gentle ambient drizzle so it still moves.
+      let dps = rain.simulate ? rain.simDropsPerSec : rain.dropsPerSec;
+
+      if (!rain.simulate && dps <= 0.05) {
+        dps = 1.2; // ambient drizzle
+      }
+
+      if (dps <= 0.05) return;
+
+      const now = millis();
+      if (now < rain.nextDropMs) return;
+
+      // Slight burstiness in heavier rain
+      const burst = dps > 12 ? 3 : (dps > 6 ? 2 : 1);
+
+      for (let i = 0; i < burst; i++) {
+        const x = random(width);
+        // Spread across the whole canvas (so it doesn't only paint the top).
+        // Still slightly favors the upper half by using a squared distribution.
+        const t = random();
+        const y = (t * t) * height;
+
+        if (MODE === MODE_STAIN) {
+          // Gentle stain pour
+          pourStain(x, y, random(0.45, 1.0));
+        } else {
+          // Lighter "rain splat" in action mode (small, thin)
+          const dir = createVector(random(-0.15, 0.15), 1).normalize();
+          makeSplat(x, y, random(10, 26), random(activePalette), dir, 0.35, true);
+        }
+      }
+
+      // Schedule next drop time with some randomness
+      const interval = 1000 / dps;
+      rain.nextDropMs = now + interval * random(0.6, 1.4);
+    }
+  </script>
+</body>
+</html>

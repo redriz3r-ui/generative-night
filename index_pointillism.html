@@ -1,0 +1,556 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Pointillism Sampler (p5.js) — Image → Dots</title>
+  <style>
+    html, body { margin:0; padding:0; height:100%; background:#0b0b0b; overflow:hidden; }
+    canvas { display:block; }
+    .hud{
+      position:fixed; left:12px; top:12px;
+      font: 12px/1.35 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      color: rgba(255,255,255,0.88);
+      background: rgba(0,0,0,0.38);
+      padding: 10px 12px;
+      border-radius: 12px;
+      user-select:none;
+      backdrop-filter: blur(6px);
+      max-width: min(720px, calc(100vw - 24px));
+    }
+    .hud kbd{
+      font: inherit;
+      padding: 1px 6px;
+      border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.2);
+      background: rgba(255,255,255,0.08);
+    }
+    .row { display:flex; flex-wrap:wrap; gap:8px 10px; align-items:center; }
+    .sub { opacity:0.8; margin-top: 8px; }
+    .controls { margin-top: 8px; display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; }
+    input[type="file"]{ font:inherit; color:rgba(255,255,255,0.9); }
+    .pill{
+      display:inline-flex; align-items:center; gap:6px;
+      padding: 2px 8px; border-radius: 999px;
+      background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.14);
+    }
+  </style>
+</head>
+<body>
+  <div class="hud" id="hud">
+    <div class="row">
+      <span class="pill"><b id="status">Load an image</b></span>
+      <span class="pill">Mode: <b id="modeLabel">DOT</b></span>
+      <span class="pill">Quality: <b id="qualityLabel">EDGE</b></span>
+    </div>
+
+    <div class="controls">
+      <label class="pill">
+        <span>Image</span>
+        <input id="imgFile" type="file" accept="image/*" />
+      </label>
+
+      <span><kbd>P</kbd> paint</span>
+      <span><kbd>V</kbd> webcam</span>
+      <span><kbd>Space</kbd> pause</span>
+      <span><kbd>C</kbd> clear</span>
+      <span><kbd>S</kbd> save</span>
+      <span><kbd>X</kbd> mirror</span>
+      <span><kbd>D</kbd> dot</span>
+      <span><kbd>F</kbd> “feather”</span>
+      <span><kbd>E</kbd> edge-aware</span>
+      <span><kbd>G</kbd> grid</span>
+      <span><kbd>[</kbd>/<kbd>]</kbd> density</span>
+      <span><kbd>-</kbd>/<kbd>=</kbd> dot size</span>
+    </div>
+
+    <div class="sub" id="info">
+      Tip: EDGE mode concentrates dots on details (edges) and relaxes on flat areas.
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.9.3/lib/p5.min.js"></script>
+  <script>
+    // ============================================================
+    // POINTILLISM SAMPLER
+    // - Load an image
+    // - Paint with many translucent dots sampled from the image
+    // - Two mark types:
+    //    DOT: single dot
+    //    FEATHER: dot with soft halo (more painterly)
+    // - Two sampling qualities:
+    //    EDGE: concentrates work where detail is high
+    //    GRID: uniform sampling
+    // ============================================================
+
+    let bg;
+    let refImg = null;     // loaded image
+    let cam = null;          // p5 capture
+    let camOn = false;
+    let mirrorCam = true;
+    let workImg = null;    // resized for sampling
+    let imgReady = false;
+
+    // Painting state
+    let painting = false;
+    let paused = false;
+
+    // Settings
+    const MODE_DOT = "DOT";
+    const MODE_FEATHER = "FEATHER";
+    let paintMode = MODE_DOT;
+
+    const QUAL_EDGE = "EDGE";
+    const QUAL_GRID = "GRID";
+    let quality = QUAL_EDGE;
+
+    // Density & size controls
+    // stepPx = average spacing between samples (lower = denser)
+    let stepPx = 6;         // controlled by [ ]
+    let baseDot = 7;        // controlled by - =
+    let alphaDot = 130;     // overall dot alpha
+    let marksPerFrame = 900; // speed of painting (adjust if slow)
+
+    // Jitter + palette feel
+    let jitterAmt = 0.45;   // position jitter as fraction of step
+    let posterize = 0;      // 0 = off, or number of levels (e.g., 6)
+
+    // Scan cursor for GRID mode
+    let scanX = 0, scanY = 0;
+
+    // HUD
+    let statusEl, modeEl, qualityEl, infoEl;
+
+    function setup() {
+      createCanvas(windowWidth, windowHeight);
+      pixelDensity(1);
+      bg = color(245, 241, 232);
+      background(bg);
+      drawGrain(0.05);
+
+      statusEl = document.getElementById("status");
+      modeEl = document.getElementById("modeLabel");
+      qualityEl = document.getElementById("qualityLabel");
+      infoEl = document.getElementById("info");
+
+      document.getElementById("imgFile").addEventListener("change", onPickImage);
+
+      updateHUD();
+    }
+
+    function draw() {
+      if (!painting || paused || !imgReady) return;
+
+      // If webcam is enabled, refresh the sampling buffer each draw
+      if (camOn && cam) {
+        updateWorkImageFromCamera();
+
+        // Adaptive speed: keep it responsive in live mode
+        const fr = frameRate();
+        marksPerFrame = floor(map(constrain(fr, 10, 60), 10, 60, 140, 520));
+      }
+
+      // Progressive painting: add many marks per frame for a "robot painting" reveal
+      for (let i = 0; i < marksPerFrame; i++) {
+        if (quality === QUAL_EDGE) {
+          paintOneEdgeAwareMark();
+        } else {
+          paintOneGridMark();
+        }
+      }
+
+      // Update HUD occasionally
+      if (frameCount % 15 === 0) updateHUD();
+    }
+
+    function windowResized() {
+      const g = get();
+      resizeCanvas(windowWidth, windowHeight);
+      background(bg);
+      image(g, 0, 0);
+    }
+
+    // ----------------------------
+    // Image loading
+    // ----------------------------
+    function onPickImage(e) {
+      const file = e.target.files?.[0];
+      if (camOn) {
+        // Switching source: stop camera when loading a file image
+        toggleCamera();
+      }
+      if (!file) return;
+
+      const url = URL.createObjectURL(file);
+      statusEl.textContent = "Loading…";
+
+      loadImage(url, (img) => {
+        refImg = img;
+        prepareWorkImage();
+        imgReady = true;
+        painting = false;
+        paused = false;
+        statusEl.textContent = "Loaded. Press P to paint.";
+        updateHUD();
+      }, () => {
+        statusEl.textContent = "Failed to load image.";
+      });
+    }
+
+    function prepareWorkImage() {
+      // Resize for sampling speed while preserving aspect ratio.
+      // Higher = more detail but slower.
+      const targetLongSide = 520; // tweak: 360..900
+      workImg = refImg.get();
+
+      const longSide = max(workImg.width, workImg.height);
+      const scale = targetLongSide / longSide;
+
+      if (scale < 1) {
+        workImg.resize(floor(workImg.width * scale), floor(workImg.height * scale));
+      }
+      workImg.loadPixels();
+
+      // Reset scan cursor for grid mode
+      scanX = 0;
+      scanY = 0;
+    }
+
+    // ----------------------------
+    // Webcam integration
+    // ----------------------------
+    function toggleCamera() {
+      if (!camOn) {
+        statusEl.textContent = "Starting camera…";
+        cam = createCapture(VIDEO, () => {
+          camOn = true;
+          imgReady = true;        // reuse existing paint pipeline
+          painting = true;        // start painting immediately
+          paused = false;
+          statusEl.textContent = "Camera on. Painting live. (V to stop)";
+          updateHUD();
+        });
+        cam.size(320, 240);
+        cam.hide(); // don't show the raw video element
+      } else {
+        if (cam) cam.remove();
+        cam = null;
+        camOn = false;
+        statusEl.textContent = "Camera off. Load an image or press V again.";
+        updateHUD();
+      }
+    }
+
+    function updateWorkImageFromCamera() {
+      if (!cam) return;
+
+      // Load pixels directly from the capture (avoid cam.get() copies)
+      cam.loadPixels();
+
+      // Treat the capture as the sampling image
+      workImg = cam;
+
+      // Note: mirroring is handled by x-coordinate flip when sampling.
+    }
+
+    // ----------------------------
+    // Painting: EDGE-aware sampling
+    // ----------------------------
+    function paintOneEdgeAwareMark() {
+      // Choose a random pixel in the work image
+      const x = floor(random(workImg.width));
+      const y = floor(random(workImg.height));
+
+      const c = sampleColor(workImg, x, y);
+
+      // Detail estimate: difference with neighbors
+      const d = localDetail(workImg, x, y); // ~0..255
+
+      // Acceptance probability based on detail
+      // High detail => more likely to place a mark
+      const accept = map(constrain(d, 0, 80), 0, 80, 0.08, 0.92);
+      if (random() > accept) return;
+
+      // Map image coords -> canvas coords with letterboxing (fit)
+      const p = mapToCanvas(x, y);
+
+      // Dot size:
+      // - darker areas can get slightly larger dots
+      // - higher detail areas use smaller dots (to resolve edges)
+      const b = brightnessOf(c);
+      const sizeFromBright = map(b, 0, 255, 1.15, 0.65);
+      const sizeFromDetail = map(constrain(d, 0, 120), 0, 120, 1.20, 0.55);
+
+      const r = baseDot * sizeFromBright * sizeFromDetail * random(0.75, 1.25);
+
+      // Jitter for organic feel
+      const j = stepPx * jitterAmt;
+      const px = p.x + randomGaussian(0, j);
+      const py = p.y + randomGaussian(0, j);
+
+      drawMark(px, py, r, c, d);
+    }
+
+    // ----------------------------
+    // Painting: GRID sampling
+    // ----------------------------
+    function paintOneGridMark() {
+      // Walk a scanning grid across the work image
+      const x = scanX;
+      const y = scanY;
+
+      scanX += stepPx;
+      if (scanX >= workImg.width) {
+        scanX = 0;
+        scanY += stepPx;
+        if (scanY >= workImg.height) {
+          // Done
+          painting = false;
+          statusEl.textContent = "Done.";
+          updateHUD();
+          return;
+        }
+      }
+
+      const xi = floor(x);
+      const yi = floor(y);
+
+      const c = sampleColor(workImg, xi, yi);
+      const d = localDetail(workImg, xi, yi);
+      const p = mapToCanvas(xi, yi);
+
+      const b = brightnessOf(c);
+      const sizeFromBright = map(b, 0, 255, 1.15, 0.65);
+      const r = baseDot * sizeFromBright * random(0.75, 1.15);
+
+      const j = stepPx * jitterAmt;
+      const px = p.x + randomGaussian(0, j);
+      const py = p.y + randomGaussian(0, j);
+
+      drawMark(px, py, r, c, d);
+    }
+
+    // ----------------------------
+    // Mark drawing (DOT / FEATHER)
+    // ----------------------------
+    function drawMark(x, y, r, c, detail) {
+      // Slight alpha modulation:
+      // - detail areas get a bit more opacity
+      const a = alphaDot * map(constrain(detail, 0, 110), 0, 110, 0.72, 1.05);
+
+      noStroke();
+
+      if (paintMode === MODE_DOT) {
+        fill(c[0], c[1], c[2], a);
+        ellipse(x, y, r, r);
+      } else {
+        // FEATHER: core + halo for painterly bleed
+        fill(c[0], c[1], c[2], a);
+        ellipse(x, y, r, r);
+
+        // halo
+        const haloA = a * 0.35;
+        fill(c[0], c[1], c[2], haloA);
+        ellipse(x + randomGaussian(0, r * 0.08), y + randomGaussian(0, r * 0.08), r * random(1.25, 1.8));
+      }
+    }
+
+    // ----------------------------
+    // Sampling utilities
+    // ----------------------------
+    function sampleColor(img, x, y) {
+      // Webcam mirror without copying: flip x coordinate
+      if (camOn && mirrorCam) {
+        x = img.width - 1 - x;
+      }
+      // Fast pixel read from pixels[] array
+      const idx = 4 * (y * img.width + x);
+      let r = img.pixels[idx];
+      let g = img.pixels[idx + 1];
+      let b = img.pixels[idx + 2];
+
+      if (posterize > 1) {
+        r = posterizeChannel(r, posterize);
+        g = posterizeChannel(g, posterize);
+        b = posterizeChannel(b, posterize);
+      }
+
+      return [r, g, b, 255];
+    }
+
+    function posterizeChannel(v, levels) {
+      const step = 255 / (levels - 1);
+      return round(v / step) * step;
+    }
+
+    function brightnessOf(c) {
+      // simple perceived-ish brightness
+      return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    }
+
+    function localDetail(img, x, y) {
+      // Cheap edge/detail estimate from pixel buffer, avoiding multiple get() calls.
+      // Uses brightness diffs to right and down neighbors.
+      const b0 = brightnessAt(img, x, y);
+      const bx = brightnessAt(img, min(x + 1, img.width - 1), y);
+      const by = brightnessAt(img, x, min(y + 1, img.height - 1));
+      return abs(b0 - bx) + abs(b0 - by);
+    }
+
+    function brightnessAt(img, x, y) {
+      // Webcam mirror without copying: flip x coordinate
+      if (camOn && mirrorCam) {
+        x = img.width - 1 - x;
+      }
+      const idx = 4 * (y * img.width + x);
+      const r = img.pixels[idx];
+      const g = img.pixels[idx + 1];
+      const b = img.pixels[idx + 2];
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    }
+
+    function mapToCanvas(ix, iy) {
+      // Fit image to canvas preserving aspect ratio, letterboxed
+      const iw = workImg.width, ih = workImg.height;
+      const cw = width, ch = height;
+
+      const s = min(cw / iw, ch / ih);
+      const dw = iw * s;
+      const dh = ih * s;
+      const ox = (cw - dw) * 0.5;
+      const oy = (ch - dh) * 0.5;
+
+      return createVector(ox + ix * s, oy + iy * s);
+    }
+
+    // ----------------------------
+    // Controls
+    // ----------------------------
+    function keyPressed() {
+      if (key === 'v' || key === 'V') {
+        toggleCamera();
+        return;
+      }
+      if (key === 'x' || key === 'X') {
+        mirrorCam = !mirrorCam;
+        statusEl.textContent = camOn ? `Camera on. Mirror ${mirrorCam ? "ON" : "OFF"}.` : "Camera off.";
+        updateHUD();
+        return;
+      }
+      if (key === 'p' || key === 'P') {
+        if (!imgReady) {
+          statusEl.textContent = "Load an image first.";
+          return;
+        }
+        painting = true;
+        paused = false;
+        statusEl.textContent = "Painting… (Space to pause)";
+        updateHUD();
+      }
+
+      if (keyCode === 32) { // Space
+        if (!painting) return;
+        paused = !paused;
+        statusEl.textContent = paused ? "Paused." : "Painting…";
+        updateHUD();
+      }
+
+      if (key === 'c' || key === 'C') {
+        background(bg);
+        drawGrain(0.05);
+        painting = false;
+        paused = false;
+        scanX = 0; scanY = 0;
+        statusEl.textContent = imgReady ? "Cleared. Press P to paint." : "Load an image.";
+        updateHUD();
+      }
+
+      if (key === 's' || key === 'S') {
+        saveCanvas(`pointillism_${paintMode.toLowerCase()}_${quality.toLowerCase()}`, 'png');
+      }
+
+      if (key === 'd' || key === 'D') {
+        paintMode = MODE_DOT;
+        updateHUD();
+      }
+      if (key === 'f' || key === 'F') {
+        paintMode = MODE_FEATHER;
+        updateHUD();
+      }
+
+      if (key === 'e' || key === 'E') {
+        quality = QUAL_EDGE;
+        updateHUD();
+      }
+      if (key === 'g' || key === 'G') {
+        quality = QUAL_GRID;
+        // reset scan cursor so grid starts clean
+        scanX = 0; scanY = 0;
+        updateHUD();
+      }
+
+      // Density: [ ] changes stepPx
+      if (key === '[') {
+        stepPx = max(2, stepPx - 1);
+        marksPerFrame = constrain(marksPerFrame + 80, 200, 2500);
+        updateHUD();
+      }
+      if (key === ']') {
+        stepPx = min(22, stepPx + 1);
+        marksPerFrame = constrain(marksPerFrame - 80, 200, 2500);
+        updateHUD();
+      }
+
+      // Dot size: - and = (plus)
+      if (key === '-') {
+        baseDot = max(1.5, baseDot - 0.5);
+        updateHUD();
+      }
+      if (key === '=' || key === '+') {
+        baseDot = min(28, baseDot + 0.5);
+        updateHUD();
+      }
+    }
+
+    function updateHUD() {
+      modeEl.textContent = paintMode === MODE_DOT ? "DOT" : "FEATHER";
+      qualityEl.textContent = quality === QUAL_EDGE ? "EDGE" : "GRID";
+
+      const qText = (quality === QUAL_EDGE)
+        ? "EDGE mode concentrates dots on detail/edges."
+        : "GRID mode paints uniformly across the image.";
+
+      const mText = (paintMode === MODE_DOT)
+        ? "DOT: crisp points."
+        : "FEATHER: soft halo points (more painterly).";
+
+      const imgText = imgReady
+        ? (camOn
+            ? `Webcam sample size: ${(workImg ? workImg.width : 0)}×${(workImg ? workImg.height : 0)} (mirror ${mirrorCam ? "ON" : "OFF"})`
+            : `Image sample size: ${workImg.width}×${workImg.height}`)
+        : "No image loaded yet.";
+
+      infoEl.textContent =
+        `${imgText}  |  ${qText}  |  ${mText}  |  step=${stepPx}px, dot=${baseDot.toFixed(1)}, speed=${marksPerFrame}/frame`;
+    }
+
+    // ----------------------------
+    // Texture helpers
+    // ----------------------------
+    function drawGrain(strength=0.06){
+      loadPixels();
+      for (let y = 0; y < height; y += 2) {
+        for (let x = 0; x < width; x += 2) {
+          const i = 4 * (y * width + x);
+          const n = (random() - 0.5) * 255 * strength;
+          pixels[i]     = constrain(pixels[i]     + n, 0, 255);
+          pixels[i + 1] = constrain(pixels[i + 1] + n, 0, 255);
+          pixels[i + 2] = constrain(pixels[i + 2] + n, 0, 255);
+        }
+      }
+      updatePixels();
+    }
+  </script>
+</body>
+</html>
